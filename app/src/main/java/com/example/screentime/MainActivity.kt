@@ -8,10 +8,17 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Process
 import android.provider.Settings
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -25,21 +32,143 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+private val BG = Color.parseColor("#0E0E10")
+private val TEXT = Color.parseColor("#F2F2F2")
+private val SECOND = Color.parseColor("#8A8A90")
+private val TRACK = Color.parseColor("#2A2A2E")
+private val ACCENT = Color.parseColor("#E53935")
+
+// Большое кольцо: сколько экрана за день относительно цели.
+class RingView(context: Context) : View(context) {
+    var progress = 0f
+    var big = ""
+    var small = ""
+
+    private val track = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = TRACK
+    }
+    private val arc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        color = ACCENT
+    }
+    private val bigPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = TEXT
+        textAlign = Paint.Align.CENTER
+        isFakeBoldText = true
+    }
+    private val smallPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = SECOND
+        textAlign = Paint.Align.CENTER
+    }
+
+    override fun onDraw(c: Canvas) {
+        val d = minOf(width, height).toFloat()
+        val stroke = d * 0.06f
+        track.strokeWidth = stroke
+        arc.strokeWidth = stroke
+        val r = d / 2f - stroke
+        val cx = width / 2f
+        val cy = height / 2f
+        val rect = RectF(cx - r, cy - r, cx + r, cy + r)
+
+        c.drawCircle(cx, cy, r, track)
+        if (progress > 0f) {
+            c.drawArc(rect, -90f, 360f * progress.coerceIn(0.01f, 1f), false, arc)
+        }
+        bigPaint.textSize = d * 0.12f
+        smallPaint.textSize = d * 0.05f
+        c.drawText(big, cx, cy + d * 0.02f, bigPaint)
+        c.drawText(small, cx, cy + d * 0.02f + d * 0.09f, smallPaint)
+    }
+}
+
+// Полоска из 7 клеток-дней: чем темнее красный, тем больше экрана. Нажатие выбирает день.
+class DayStrip(context: Context) : View(context) {
+    var values: List<Long> = emptyList()     // слева старые дни, справа сегодня
+    var labels: List<String> = emptyList()
+    var selected = 0
+    var onPick: ((Int) -> Unit)? = null
+
+    private val cell = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.WHITE
+    }
+    private val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        color = SECOND
+    }
+    private val hours = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        color = Color.WHITE
+        isFakeBoldText = true
+    }
+
+    private fun gap(w: Int): Float = w * 0.02f
+
+    override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+        val w = MeasureSpec.getSize(widthSpec)
+        val n = maxOf(values.size, 1)
+        val cw = (w - gap(w) * (n - 1)) / n
+        setMeasuredDimension(w, (cw * 1.5f).toInt())
+    }
+
+    override fun onDraw(c: Canvas) {
+        val n = values.size
+        if (n == 0) return
+        val g = gap(width)
+        val cw = (width - g * (n - 1)) / n
+        val maxV = maxOf(values.maxOrNull() ?: 0L, 1L)
+        label.textSize = cw * 0.27f
+        hours.textSize = cw * 0.27f
+        outline.strokeWidth = cw * 0.06f
+
+        for (i in 0 until n) {
+            val left = i * (cw + g)
+            val rect = RectF(left, 0f, left + cw, cw)
+            val v = values[i]
+            val alpha = if (v <= 0L) 25 else (70 + 185 * (v.toFloat() / maxV)).toInt()
+            cell.color = Color.argb(alpha, 229, 57, 53)
+            c.drawRoundRect(rect, cw * 0.22f, cw * 0.22f, cell)
+            if (i == selected) {
+                c.drawRoundRect(rect, cw * 0.22f, cw * 0.22f, outline)
+            }
+            val txt = if (v <= 0L) "–" else String.format(Locale.US, "%.1f", v / 3600000.0)
+            c.drawText(txt, rect.centerX(), rect.centerY() + hours.textSize * 0.35f, hours)
+            c.drawText(labels[i], rect.centerX(), cw + label.textSize * 1.5f, label)
+        }
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (e.action == MotionEvent.ACTION_UP && values.isNotEmpty()) {
+            val idx = (e.x / width * values.size).toInt().coerceIn(0, values.size - 1)
+            onPick?.invoke(idx)
+        }
+        return true
+    }
+}
+
 class MainActivity : Activity() {
 
-    private lateinit var info: TextView
-    private lateinit var button: Button
-    private lateinit var nav: LinearLayout
-    private lateinit var prev: Button
-    private lateinit var next: Button
-    private lateinit var dateText: TextView
     private lateinit var prefs: SharedPreferences
+    private lateinit var content: LinearLayout
+    private lateinit var dateText: TextView
+    private lateinit var ring: RingView
+    private lateinit var strip: DayStrip
+    private lateinit var appsTitle: TextView
+    private lateinit var apps: LinearLayout
+    private lateinit var message: TextView
+    private lateinit var button: Button
 
     private val days = 7          // сколько последних дней показываем
+    private val goalMs = 4L * 3600000L   // дневная цель для кольца: 4 часа
     private var offset = 0        // 0 = сегодня, 1 = вчера, ...
 
     private val keyFormat = SimpleDateFormat("yyyyMMdd", Locale.US)
-    private val titleFormat = SimpleDateFormat("EEE, d MMM", Locale("ru"))
+    private val titleFormat = SimpleDateFormat("EEEE, d MMMM", Locale("ru"))
+    private val shortFormat = SimpleDateFormat("EEE", Locale("ru"))
 
     // Итоги за день: время экрана, число разблокировок и время по приложениям.
     private class DayStats(
@@ -48,65 +177,100 @@ class MainActivity : Activity() {
         val apps: List<Pair<String, Long>>
     )
 
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("flyt_screen", Context.MODE_PRIVATE)
+        window.statusBarColor = BG
+        window.navigationBarColor = BG
 
-        val root = LinearLayout(this).apply {
+        content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 120, 48, 48)
+            setPadding(dp(20), dp(44), dp(20), dp(32))
         }
 
-        prev = Button(this).apply {
-            text = "◀"
-            setOnClickListener {
-                if (offset < days - 1) {
-                    offset++
-                    render()
-                }
-            }
-        }
-        next = Button(this).apply {
-            text = "▶"
-            setOnClickListener {
-                if (offset > 0) {
-                    offset--
-                    render()
-                }
-            }
+        val title = TextView(this).apply {
+            text = "Flyt Screen"
+            textSize = 26f
+            setTextColor(TEXT)
+            typeface = Typeface.DEFAULT_BOLD
         }
         dateText = TextView(this).apply {
-            textSize = 20f
-            gravity = Gravity.CENTER
+            textSize = 16f
+            setTextColor(SECOND)
         }
-        nav = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(prev)
-            addView(
-                dateText,
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            addView(next)
+        ring = RingView(this)
+        strip = DayStrip(this)
+        strip.onPick = { idx ->
+            offset = days - 1 - idx
+            render()
         }
-
-        info = TextView(this).apply {
-            textSize = 20f
-            setPadding(0, 32, 0, 0)
+        appsTitle = TextView(this).apply {
+            text = "ПРИЛОЖЕНИЯ"
+            textSize = 13f
+            letterSpacing = 0.12f
+            setTextColor(SECOND)
+        }
+        apps = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        message = TextView(this).apply {
+            textSize = 17f
+            setTextColor(TEXT)
         }
         button = Button(this).apply {
             text = "Выдать доступ к статистике"
+            setTextColor(Color.WHITE)
+            setAllCaps(false)
+            background = GradientDrawable().apply {
+                setColor(ACCENT)
+                cornerRadius = dp(14).toFloat()
+            }
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
             }
         }
 
-        root.addView(nav)
-        root.addView(info)
-        root.addView(button)
+        content.addView(title)
+        content.addView(dateText)
+        content.addView(
+            ring,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(260)).apply {
+                topMargin = dp(12)
+            }
+        )
+        content.addView(
+            strip,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        )
+        content.addView(
+            appsTitle,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(28) }
+        )
+        content.addView(apps)
+        content.addView(
+            message,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(24) }
+        )
+        content.addView(
+            button,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(52)
+            ).apply { topMargin = dp(20) }
+        )
 
         val scroll = ScrollView(this)
-        scroll.addView(root)
+        scroll.setBackgroundColor(BG)
+        scroll.addView(content)
         setContentView(scroll)
     }
 
@@ -127,13 +291,24 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         if (!hasUsageAccess()) {
-            nav.visibility = View.GONE
-            info.text = "Нужен доступ к данным об использовании.\n\n" +
+            val visible = View.GONE
+            dateText.visibility = visible
+            ring.visibility = visible
+            strip.visibility = visible
+            appsTitle.visibility = visible
+            apps.visibility = visible
+            message.visibility = View.VISIBLE
+            message.text = "Нужен доступ к данным об использовании.\n\n" +
                 "Нажми кнопку, найди в списке Flyt Screen и включи доступ."
             button.visibility = View.VISIBLE
             return
         }
-        nav.visibility = View.VISIBLE
+        dateText.visibility = View.VISIBLE
+        ring.visibility = View.VISIBLE
+        strip.visibility = View.VISIBLE
+        appsTitle.visibility = View.VISIBLE
+        apps.visibility = View.VISIBLE
+        message.visibility = View.GONE
         button.visibility = View.GONE
 
         syncDays()
@@ -187,39 +362,98 @@ class MainActivity : Activity() {
             1 -> "Вчера"
             else -> titleFormat.format(Date(start))
         }
-        prev.isEnabled = offset < days - 1
-        next.isEnabled = offset > 0
 
-        val sb = StringBuilder()
+        // кольцо
         if (s == null) {
-            sb.append("Нет данных за этот день.\n")
-            sb.append("(Система хранит события недолго, а приложение сохраняет итоги только при открытии.)\n")
+            ring.progress = 0f
+            ring.big = "—"
+            ring.small = "нет данных"
         } else {
-            sb.append("Экран включён: ").append(formatDuration(s.screenMs)).append("\n")
-            sb.append("Разблокировок: ").append(s.unlocks).append("\n\n")
-            sb.append("По приложениям:\n")
-            if (s.apps.isEmpty()) {
-                sb.append("пока нет данных\n")
-            } else {
-                for ((name, ms) in s.apps) {
-                    sb.append("• ").append(name).append(" — ").append(formatDuration(ms)).append("\n")
-                }
-            }
+            ring.progress = s.screenMs.toFloat() / goalMs
+            ring.big = formatShort(s.screenMs)
+            ring.small = "${s.unlocks} разбл. · цель 4 ч"
         }
+        ring.invalidate()
 
-        sb.append("\nПоследние дни:\n")
-        for (i in 0 until days) {
-            val (st, _) = dayRange(i)
-            val d = load(dayKey(st))
-            sb.append(titleFormat.format(Date(st))).append(" — ")
-            if (d == null) {
-                sb.append("нет данных\n")
-            } else {
-                sb.append(formatDuration(d.screenMs)).append(", ")
-                    .append(d.unlocks).append(" разбл.\n")
+        // полоска дней: слева старые, справа сегодня
+        val vals = ArrayList<Long>()
+        val labs = ArrayList<String>()
+        for (idx in 0 until days) {
+            val daysAgo = days - 1 - idx
+            val (st, _) = dayRange(daysAgo)
+            vals.add(load(dayKey(st))?.screenMs ?: 0L)
+            labs.add(shortFormat.format(Date(st)))
+        }
+        strip.values = vals
+        strip.labels = labs
+        strip.selected = days - 1 - offset
+        strip.requestLayout()
+        strip.invalidate()
+
+        // приложения
+        apps.removeAllViews()
+        val list = s?.apps ?: emptyList()
+        if (list.isEmpty()) {
+            apps.addView(TextView(this).apply {
+                text = "Нет данных за этот день"
+                textSize = 15f
+                setTextColor(SECOND)
+                setPadding(0, dp(12), 0, 0)
+            })
+        } else {
+            val maxMs = list.maxOf { it.second }
+            for ((name, ms) in list) {
+                apps.addView(appRow(name, ms, maxMs))
             }
         }
-        info.text = sb.toString()
+    }
+
+    // Строка приложения: название, время и красная полоска пропорциональной длины.
+    private fun appRow(name: String, ms: Long, maxMs: Long): View {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, dp(4))
+        }
+        val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val n = TextView(this).apply {
+            text = name
+            textSize = 16f
+            setTextColor(TEXT)
+            maxLines = 1
+        }
+        val t = TextView(this).apply {
+            text = formatDuration(ms)
+            textSize = 16f
+            setTextColor(SECOND)
+            gravity = Gravity.END
+        }
+        line.addView(n, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        line.addView(
+            t,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(TRACK)
+        }
+        val fill = View(this)
+        fill.setBackgroundColor(ACCENT)
+        val rest = View(this)
+        bar.addView(fill, LinearLayout.LayoutParams(0, dp(4), ms.toFloat()))
+        bar.addView(rest, LinearLayout.LayoutParams(0, dp(4), (maxMs - ms).toFloat()))
+
+        col.addView(line)
+        col.addView(
+            bar,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(4)).apply {
+                topMargin = dp(6)
+            }
+        )
+        return col
     }
 
     // Хранилище итогов по дням (SharedPreferences, только на телефоне).
@@ -240,12 +474,12 @@ class MainActivity : Activity() {
         return try {
             val o = JSONObject(str)
             val arr = o.getJSONArray("apps")
-            val apps = ArrayList<Pair<String, Long>>()
+            val list = ArrayList<Pair<String, Long>>()
             for (i in 0 until arr.length()) {
                 val p = arr.getJSONArray(i)
-                apps.add(Pair(p.getString(0), p.getLong(1)))
+                list.add(Pair(p.getString(0), p.getLong(1)))
             }
-            DayStats(o.getLong("screen"), o.getInt("unlocks"), apps)
+            DayStats(o.getLong("screen"), o.getInt("unlocks"), list)
         } catch (ex: Exception) {
             null
         }
@@ -307,13 +541,13 @@ class MainActivity : Activity() {
             appMs[p] = (appMs[p] ?: 0L) + (end - s)
         }
 
-        val apps = appMs.entries
+        val list = appMs.entries
             .filter { it.value >= 60_000 }
             .sortedByDescending { it.value }
             .take(15)
             .map { Pair(label(it.key), it.value) }
 
-        return DayStats(screenTotal, unlocks, apps)
+        return DayStats(screenTotal, unlocks, list)
     }
 
     // Человеческое название приложения; если не нашли, показываем имя пакета.
@@ -330,5 +564,12 @@ class MainActivity : Activity() {
         val h = minutes / 60
         val m = minutes % 60
         return if (h > 0) "$h ч $m мин" else "$m мин"
+    }
+
+    private fun formatShort(ms: Long): String {
+        val minutes = ms / 60000
+        val h = minutes / 60
+        val m = minutes % 60
+        return if (h > 0) "$h ч $m м" else "$m м"
     }
 }
