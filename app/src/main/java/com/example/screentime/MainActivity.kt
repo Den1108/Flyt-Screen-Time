@@ -6,12 +6,14 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Process
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import java.util.Calendar
 
@@ -20,6 +22,13 @@ class MainActivity : Activity() {
     private lateinit var info: TextView
     private lateinit var button: Button
 
+    // Итоги за день: время экрана, число разблокировок и время по приложениям.
+    private class DayStats(
+        val screenMs: Long,
+        val unlocks: Int,
+        val apps: List<Pair<String, Long>>
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -27,7 +36,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 120, 48, 48)
         }
-        info = TextView(this).apply { textSize = 22f }
+        info = TextView(this).apply { textSize = 20f }
         button = Button(this).apply {
             text = "Выдать доступ к статистике"
             setOnClickListener {
@@ -36,7 +45,10 @@ class MainActivity : Activity() {
         }
         root.addView(info)
         root.addView(button)
-        setContentView(root)
+
+        val scroll = ScrollView(this)
+        scroll.addView(root)
+        setContentView(scroll)
     }
 
     override fun onResume() {
@@ -63,14 +75,24 @@ class MainActivity : Activity() {
         }
         button.visibility = View.GONE
 
-        val (screenMs, unlocks) = todayStats()
-        info.text = "Сегодня\n\n" +
-            "Экран включён: ${formatDuration(screenMs)}\n" +
-            "Разблокировок: $unlocks"
+        val s = todayStats()
+        val sb = StringBuilder()
+        sb.append("Сегодня\n\n")
+        sb.append("Экран включён: ").append(formatDuration(s.screenMs)).append("\n")
+        sb.append("Разблокировок: ").append(s.unlocks).append("\n\n")
+        sb.append("По приложениям:\n")
+        if (s.apps.isEmpty()) {
+            sb.append("пока нет данных")
+        } else {
+            for ((name, ms) in s.apps) {
+                sb.append("• ").append(name).append(" — ").append(formatDuration(ms)).append("\n")
+            }
+        }
+        info.text = sb.toString()
     }
 
-    // Считает время с включённым экраном и число разблокировок с 00:00 до сейчас.
-    private fun todayStats(): Pair<Long, Int> {
+    // Читает журнал событий системы с 00:00 до сейчас и считает итоги.
+    private fun todayStats(): DayStats {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
 
         val cal = Calendar.getInstance().apply {
@@ -85,26 +107,72 @@ class MainActivity : Activity() {
         val events = usm.queryEvents(start, end)
         val e = UsageEvents.Event()
 
-        var total = 0L
-        var lastOn: Long? = null
+        var screenTotal = 0L
+        var screenOn: Long? = null
         var unlocks = 0
+
+        val depth = HashMap<String, Int>()      // сколько окон приложения открыто
+        val since = HashMap<String, Long>()     // когда приложение вышло на передний план
+        val appMs = HashMap<String, Long>()     // накопленное время по приложениям
 
         while (events.hasNextEvent()) {
             events.getNextEvent(e)
+            val t = e.timeStamp
+            val pkg = e.packageName ?: ""
+
             when (e.eventType) {
-                UsageEvents.Event.SCREEN_INTERACTIVE -> lastOn = e.timeStamp
+                UsageEvents.Event.SCREEN_INTERACTIVE -> screenOn = t
                 UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
-                    // если экран уже горел до полуночи, считаем от начала дня
-                    total += e.timeStamp - (lastOn ?: start)
-                    lastOn = null
+                    screenTotal += t - (screenOn ?: start)
+                    screenOn = null
+                    // экран погас: закрываем все открытые приложения
+                    for ((p, s) in since) {
+                        appMs[p] = (appMs[p] ?: 0L) + (t - s)
+                    }
+                    since.clear()
+                    depth.clear()
                 }
                 UsageEvents.Event.KEYGUARD_HIDDEN -> unlocks++
+                UsageEvents.Event.ACTIVITY_RESUMED -> {
+                    val d = depth[pkg] ?: 0
+                    if (d == 0) since[pkg] = t
+                    depth[pkg] = d + 1
+                }
+                UsageEvents.Event.ACTIVITY_PAUSED -> {
+                    val d = depth[pkg] ?: 0
+                    if (d > 0) {
+                        depth[pkg] = d - 1
+                        if (d - 1 == 0) {
+                            val s = since.remove(pkg)
+                            if (s != null) appMs[pkg] = (appMs[pkg] ?: 0L) + (t - s)
+                        }
+                    }
+                }
             }
         }
-        // экран горит прямо сейчас
-        lastOn?.let { total += end - it }
 
-        return Pair(total, unlocks)
+        // экран горит и приложения открыты прямо сейчас
+        screenOn?.let { screenTotal += end - it }
+        for ((p, s) in since) {
+            appMs[p] = (appMs[p] ?: 0L) + (end - s)
+        }
+
+        val apps = appMs.entries
+            .filter { it.value >= 60_000 }
+            .sortedByDescending { it.value }
+            .take(15)
+            .map { Pair(label(it.key), it.value) }
+
+        return DayStats(screenTotal, unlocks, apps)
+    }
+
+    // Человеческое название приложения; если не нашли, показываем имя пакета.
+    private fun label(pkg: String): String {
+        return try {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+        } catch (ex: PackageManager.NameNotFoundException) {
+            pkg
+        }
     }
 
     private fun formatDuration(ms: Long): String {
